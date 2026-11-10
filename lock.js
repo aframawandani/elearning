@@ -7,8 +7,9 @@
  *   window.ELEARNING_KIOSK_CONFIG = {
  *     apiBaseUrl: "https://your-kiosk-host.example.com",
  *     lockAfterMs: 3000,
+ *     keepScreenAwake: true,
  *   };
- *   // then load this file with <script src=".../kiosk-lock.js" defer></script>
+ *   // then load kiosk-lock.min.js with <script src=".../kiosk-lock.min.js" defer></script>
  *
  * Google Authenticator-style TOTP: when a client secret is configured, this
  * script computes the expected 4-digit code from the local clock and compares
@@ -24,13 +25,38 @@
   if (window.__ELEARNING_KIOSK_LOCK_LOADED__) return;
   window.__ELEARNING_KIOSK_LOCK_LOADED__ = true;
 
+  // Default ke origin tempat kiosk-lock.js dimuat, supaya fetch public key
+  // tidak mengarah ke origin Moodle ketika apiBaseUrl lupa diisi.
+  var scriptOrigin = "";
+  try {
+    var scriptElement =
+      document.currentScript ||
+      document.querySelector('script[src*="kiosk-lock"]');
+    if (scriptElement && scriptElement.src) {
+      scriptOrigin = new URL(scriptElement.src).origin;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+
   var DEFAULTS = {
-    apiBaseUrl: "",
+    apiBaseUrl: scriptOrigin,
     lockAfterMs: 3000,
     storageKey: "elearning-kiosk-lock",
     zIndex: 2147483647,
-    publicKeyJwk: null,
+    // Public key ditanam langsung supaya kiosk-lock bisa standalone tanpa
+    // fetch ke server. Jika key dirotasi, update bagian ini lalu jalankan
+    // `npm run build:kiosk`.
+    publicKeyJwk: {
+      kty: "OKP",
+      crv: "Ed25519",
+      x: "ZmS1lzKLeZIr7DQO6bs-iQC_nbxJR474U6Ga4cgRSAQ",
+    },
     studentOnly: true,
+    // Hanya aktifkan lock di halaman pengerjaan quiz Moodle.
+    quizOnly: true,
+    quizIncludeSummary: true,
+    quizCmid: [],
     roleEndpoint: "",
     roleCacheMs: 60000,
     assumeStudentWhenUnknown: false,
@@ -38,11 +64,18 @@
     studentUserIds: [],
     domDefaultIsStudent: true,
     debug: false,
+    // Layar tetap menyala selama siswa mengerjakan quiz (Screen Wake Lock).
+    keepScreenAwake: true,
     demoMode: false,
+    // Kode 4 digit offline (opsional). Seed bisa berupa string acak panjang
+    // atau 64 karakter hex. Kode dihitung dari seed + jendela waktu, mirip
+    // TOTP, sehingga berputar tanpa perlu koneksi ke server.
+    unlockCodeSeed: null,
     totpSecret: null,
     totpPeriodSeconds: 30,
     totpDigits: 4,
     totpGraceWindows: 0,
+    totpMaxAttempts: 5,
     clientVerify: false,
     signedKeyUrl: "/api/kiosk/signed-key",
     serverVerify: false,
@@ -52,6 +85,12 @@
   };
 
   var config = Object.assign({}, DEFAULTS, window.ELEARNING_KIOSK_CONFIG || {});
+
+  // `unlockCodeSeed` adalah nama yang lebih jelas untuk seed kode 4 digit.
+  // `totpSecret` tetap didukung agar konfigurasi lama tidak rusak.
+  if (!config.totpSecret && config.unlockCodeSeed) {
+    config.totpSecret = String(config.unlockCodeSeed);
+  }
 
   // Legacy TOTP client-side. Alur aktif sekarang adalah QR/token yang
   // diverifikasi dengan public key; mode ini hanya aktif jika totpSecret
@@ -73,10 +112,36 @@
   }
   var storage = makeStorageKeys(config.storageKey);
 
+  // Fallback offline yang di-bundle oleh `npm run build:kiosk`:
+  // - jsQR: decode QR saat BarcodeDetector tidak tersedia.
+  // - @noble/ed25519: verifikasi tanda tangan saat WebCrypto tidak punya
+  //   algoritma Ed25519.
+  // Jika kiosk-lock.js dimuat langsung tanpa bundle, keduanya null dan script
+  // tetap memakai API bawaan browser.
+  var vendor = window.__ELEARNING_KIOSK_VENDOR__ || null;
+  var jsQrLib =
+    vendor && typeof vendor.jsQR === "function" ? vendor.jsQR : null;
+  var ed25519Lib = null;
+
+  if (
+    vendor &&
+    vendor.ed25519 &&
+    typeof vendor.ed25519.verify === "function"
+  ) {
+    ed25519Lib = vendor.ed25519;
+
+    if (typeof vendor.sha512 === "function") {
+      if (ed25519Lib.hashes) {
+        ed25519Lib.hashes.sha512 = vendor.sha512;
+      }
+    }
+  }
+
   var locked = false;
   var awayAt = null;
   var awayTimer = null;
   var blurTimer = null;
+  var pageUnloading = false;
   var busy = false;
   var initialized = false;
   var roleResolved = !config.studentOnly;
@@ -102,8 +167,16 @@
   var scannerStream = null;
   var scannerVideo = null;
   var scannerDetector = null;
+  var scannerCanvas = null;
+  var scannerContext = null;
+  var scannerLastScan = 0;
   var scannerActive = false;
   var scannerFrame = null;
+  var fullscreenDrag = null;
+  var suppressFullscreenClick = false;
+  var wakeLockSentinel = null;
+  var wakeLockPending = null;
+  var wakeLockRequestId = 0;
 
   var host = null;
   var shadow = null;
@@ -112,11 +185,98 @@
   function makeStorageKeys(prefix) {
     return {
       locked: prefix + ":locked",
+      lockedScope: prefix + ":lockedScope",
       away: prefix + ":awayAt",
       role: prefix + ":role:",
       used: prefix + ":usedTokens",
+      codeAttempts: prefix + ":codeAttempts",
       device: prefix + ":deviceId",
+      fullscreenPos: prefix + ":fullscreenPos",
     };
+  }
+
+  function getUnlockCodeSeed() {
+    return (
+      String(config.totpSecret || "").trim() ||
+      String(config.unlockCodeSeed || "").trim()
+    );
+  }
+
+  function isUnlockCodeEnabled() {
+    return Boolean(getUnlockCodeSeed());
+  }
+
+  function getUnlockCodePeriodSeconds() {
+    return Math.max(
+      5,
+      Math.min(
+        300,
+        Math.round(Number(config.totpPeriodSeconds) || 30),
+      ),
+    );
+  }
+
+  function getUnlockCodePeriodMs() {
+    return getUnlockCodePeriodSeconds() * 1000;
+  }
+
+  function getUnlockCodeDigits() {
+    return Math.max(
+      4,
+      Math.min(10, Math.round(Number(config.totpDigits) || 4)),
+    );
+  }
+
+  function getUnlockCodeGraceWindows() {
+    return Math.max(
+      0,
+      Math.min(2, Math.round(Number(config.totpGraceWindows) || 0)),
+    );
+  }
+
+  function getUnlockCodeMaxAttempts() {
+    return Math.max(
+      1,
+      Math.min(20, Math.round(Number(config.totpMaxAttempts) || 5)),
+    );
+  }
+
+  function readCodeAttemptState(windowId) {
+    try {
+      var raw = safeGet(storage.codeAttempts);
+      if (!raw) return { windowId: windowId, count: 0 };
+
+      var parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        Number(parsed.windowId) === windowId &&
+        isFinite(parsed.count) &&
+        parsed.count >= 0
+      ) {
+        return { windowId: windowId, count: Math.floor(parsed.count) };
+      }
+    } catch (_) {
+      /* ignore */
+    }
+
+    return { windowId: windowId, count: 0 };
+  }
+
+  function recordCodeAttemptFailure(windowId) {
+    var state = readCodeAttemptState(windowId);
+    state.count += 1;
+
+    try {
+      safeSet(storage.codeAttempts, JSON.stringify(state));
+    } catch (_) {
+      /* ignore */
+    }
+
+    return state;
+  }
+
+  function clearCodeAttempts() {
+    safeRemove(storage.codeAttempts);
   }
 
   function log() {
@@ -253,6 +413,47 @@
         return String(item).trim();
       })
       .filter(Boolean);
+  }
+
+  function getQueryParam(name) {
+    try {
+      return new URLSearchParams(window.location.search).get(name);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isQuizPage() {
+    if (!config.quizOnly) return true;
+
+    var bodyId = document.body ? document.body.id : "";
+    var path = String(window.location.pathname || "");
+
+    var isAttempt =
+      bodyId === "page-mod-quiz-attempt" ||
+      /\/mod\/quiz\/attempt\.php\/?$/.test(path);
+    var isSummary =
+      config.quizIncludeSummary &&
+      (bodyId === "page-mod-quiz-summary" ||
+        /\/mod\/quiz\/summary\.php\/?$/.test(path));
+
+    if (!isAttempt && !isSummary) return false;
+
+    var allowedCmid = normalizeIdList(config.quizCmid);
+    if (!allowedCmid.length) return true;
+
+    var cmid = getQueryParam("cmid");
+    return Boolean(cmid && allowedCmid.indexOf(cmid) !== -1);
+  }
+
+  function getQuizScope() {
+    if (!isQuizPage()) return "";
+
+    var attempt = getQueryParam("attempt");
+    if (attempt && attempt !== "0") return "attempt:" + attempt;
+
+    var cmid = getQueryParam("cmid");
+    return cmid ? "cmid:" + cmid : "page";
   }
 
   function looksLikeStaffUi() {
@@ -473,11 +674,97 @@
     }
   }
 
+  function releaseWakeLockSentinel(sentinel) {
+    try {
+      var result = sentinel.release();
+      if (result && typeof result.catch === "function") {
+        result.catch(function () {
+          /* ignore */
+        });
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function canUseScreenWakeLock() {
+    return Boolean(
+      config.keepScreenAwake &&
+        navigator.wakeLock &&
+        typeof navigator.wakeLock.request === "function",
+    );
+  }
+
+  // Cegah layar mati saat siswa mengerjakan soal. Wake lock otomatis
+  // dilepas browser ketika tab disembunyikan, jadi minta ulang setiap kali
+  // halaman kembali terlihat.
+  function requestScreenWakeLock() {
+    if (!canUseScreenWakeLock()) return;
+    if (!initialized || locked || !roleResolved || !isStudent) return;
+    if (!isQuizPage()) return;
+    if (document.visibilityState !== "visible") return;
+    if (wakeLockSentinel && !wakeLockSentinel.released) return;
+    if (wakeLockPending) return;
+
+    var requestId = ++wakeLockRequestId;
+
+    wakeLockPending = navigator.wakeLock
+      .request("screen")
+      .then(function (sentinel) {
+        if (requestId !== wakeLockRequestId) {
+          releaseWakeLockSentinel(sentinel);
+          return;
+        }
+
+        wakeLockPending = null;
+
+        if (locked || document.visibilityState !== "visible") {
+          releaseWakeLockSentinel(sentinel);
+          return;
+        }
+
+        wakeLockSentinel = sentinel;
+        sentinel.addEventListener("release", function () {
+          if (wakeLockSentinel === sentinel) wakeLockSentinel = null;
+          log("screen wake lock dilepas");
+        });
+        log("screen wake lock aktif: layar tetap menyala");
+      })
+      .catch(function (error) {
+        if (requestId !== wakeLockRequestId) return;
+        wakeLockPending = null;
+        wakeLockSentinel = null;
+        log("screen wake lock tidak tersedia", error);
+      });
+  }
+
+  function stopScreenWakeLock() {
+    wakeLockRequestId += 1;
+    wakeLockPending = null;
+
+    var sentinel = wakeLockSentinel;
+    wakeLockSentinel = null;
+
+    if (sentinel) {
+      releaseWakeLockSentinel(sentinel);
+      log("screen wake lock dihentikan");
+    }
+  }
+
   function onVisibilityChange() {
+    // Saat halaman di-unload karena navigasi, sebagian browser mengirim
+    // visibilitychange "hidden" setelah pagehide. Itu bukan user yang
+    // meninggalkan aplikasi, jadi jangan mulai hitung mundur.
+    if (pageUnloading) return;
+
     if (document.visibilityState === "hidden") {
+      // Browser melepas wake lock saat tab hidden; lepaskan eksplisit
+      // supaya referensi sentinel tidak tertinggal.
+      stopScreenWakeLock();
       markAway();
     } else {
       markBack();
+      requestScreenWakeLock();
     }
   }
 
@@ -486,6 +773,7 @@
     // Wait a tick so focus moving into an iframe is not treated as leaving.
     blurTimer = window.setTimeout(function () {
       blurTimer = null;
+      if (pageUnloading) return;
       if (!hasAppFocus()) markAway();
     }, 80);
   }
@@ -497,38 +785,73 @@
   }
 
   function onUserActivity() {
-    if (document.visibilityState === "visible") markBack();
+    if (document.visibilityState === "visible") {
+      markBack();
+      requestScreenWakeLock();
+    }
   }
 
   function onPageHide() {
-    // Only persist when the app is actually hidden/closed. Normal same-tab
-    // navigation should not lock the user after a slow page load.
-    if (document.visibilityState === "hidden") markAway();
+    // Tandai dokumen sedang ditinggalkan. Event visibilitychange "hidden"
+    // yang menyusul adalah bagian dari proses unload, bukan bukti user
+    // pindah tab/aplikasi. Dengan flag ini, navigasi antar halaman Moodle
+    // tidak memulai hitung mundur walaupun halaman baru lambat dimuat.
+    pageUnloading = true;
   }
 
   function onPageShow() {
+    pageUnloading = false;
+
     if (locked) return;
 
     var stored = Number(safeGet(storage.away) || 0);
     if (stored && Date.now() - stored >= config.lockAfterMs) {
       safeRemove(storage.away);
       lock("restored-page");
-    } else if (stored) {
+      return;
+    }
+
+    if (stored) {
       safeRemove(storage.away);
+    }
+
+    // Halaman bisa dimuat saat tab/aplikasi sudah tidak terlihat, misalnya
+    // user pindah tab ketika navigasi sedang berjalan.
+    if (document.visibilityState === "hidden") {
+      markAway();
+    } else {
+      requestScreenWakeLock();
     }
   }
 
   function onStorage(event) {
-    if (event.key === storage.locked && event.newValue === "1" && !locked) {
-      lock("other-tab");
+    if (event.key !== storage.locked || event.newValue !== "1" || locked) {
+      return;
     }
+
+    if (config.quizOnly) {
+      var storedScope = safeGet(storage.lockedScope);
+      if (storedScope && storedScope !== getQuizScope()) return;
+    }
+
+    lock("other-tab");
   }
 
   function checkBootState() {
     if (safeGet(storage.locked) === "1") {
-      lock("stored-lock");
+      var storedScope = safeGet(storage.lockedScope);
+      var currentScope = getQuizScope();
+
+      if (!config.quizOnly || !storedScope || storedScope === currentScope) {
+        lock("stored-lock");
+      } else {
+        safeRemove(storage.locked);
+        safeRemove(storage.lockedScope);
+      }
       return;
     }
+
+    safeRemove(storage.lockedScope);
 
     var stored = Number(safeGet(storage.away) || 0);
     safeRemove(storage.away);
@@ -542,6 +865,11 @@
     if (locked) return;
 
     ensureInitialized();
+
+    if (!isQuizPage()) {
+      log("lock skipped: bukan halaman quiz", reason || "manual");
+      return;
+    }
 
     if (!roleResolved) {
       if (rolePromise) {
@@ -566,6 +894,8 @@
     locked = true;
     awayAt = null;
     clearAwayTimer();
+    stopScreenWakeLock();
+    safeSet(storage.lockedScope, getQuizScope());
     safeSet(storage.locked, "1");
     safeRemove(storage.away);
     showOverlay();
@@ -578,13 +908,16 @@
     if (!locked) return;
 
     locked = false;
+    clearCodeAttempts();
     safeRemove(storage.locked);
+    safeRemove(storage.lockedScope);
     safeRemove(storage.away);
     clearAwayTimer();
     stopScanner();
     stopDemoKeyRefresh();
     stopSignedKeyRefresh();
     hideOverlay();
+    requestScreenWakeLock();
     emit("unlock", {});
     callHook(config.onUnlock, {});
     log("unlocked");
@@ -613,6 +946,9 @@
     if (!ui) return;
     ui.error.textContent = message || "";
     ui.error.classList.toggle("is-visible", Boolean(message));
+    if (!message && ui.codeInput) {
+      ui.codeInput.removeAttribute("aria-invalid");
+    }
     if (message) {
       ui.panel.classList.remove("shake");
       void ui.panel.offsetWidth;
@@ -629,6 +965,8 @@
         ui.scanButton.style.display = "";
       }
     }
+    if (ui.codeInput) ui.codeInput.disabled = value;
+    if (ui.codeSubmit) ui.codeSubmit.disabled = value;
     if (ui.demoButton) ui.demoButton.disabled = value;
   }
 
@@ -643,8 +981,13 @@
 
     if (event.key !== "Tab" || !ui) return;
 
-    var focusables = [ui.scanButton, ui.fullscreenButton].filter(function (el) {
-      return el && el.style.display !== "none";
+    var focusables = [
+      ui.scanButton,
+      ui.codeInput,
+      ui.codeSubmit,
+      ui.fullscreenButton,
+    ].filter(function (el) {
+      return el && !el.disabled && el.getClientRects().length > 0;
     });
 
     if (!focusables.length) return;
@@ -693,6 +1036,9 @@
     scannerStream = null;
     scannerVideo = null;
     scannerDetector = null;
+    scannerCanvas = null;
+    scannerContext = null;
+    scannerLastScan = 0;
 
     if (ui && ui.scanner) {
       ui.scanner.classList.remove("is-visible");
@@ -708,34 +1054,95 @@
   }
 
   function scanLoop() {
-    if (!scannerActive || !scannerDetector || !scannerVideo) return;
+    if (!scannerActive || !scannerVideo) return;
 
-    scannerDetector
-      .detect(scannerVideo)
-      .then(function (codes) {
-        if (!scannerActive) return;
+    if (scannerDetector) {
+      scannerDetector
+        .detect(scannerVideo)
+        .then(function (codes) {
+          if (!scannerActive) return;
 
-        if (codes && codes.length && codes[0].rawValue) {
-          var value = String(codes[0].rawValue);
-          stopScanner();
-          verifyToken(value);
-          return;
-        }
+          if (codes && codes.length && codes[0].rawValue) {
+            var value = String(codes[0].rawValue);
+            stopScanner();
+            verifyToken(value);
+            return;
+          }
 
-        scannerFrame = window.requestAnimationFrame(scanLoop);
-      })
-      .catch(function () {
-        if (scannerActive) {
           scannerFrame = window.requestAnimationFrame(scanLoop);
-        }
+        })
+        .catch(function () {
+          if (scannerActive) {
+            scannerFrame = window.requestAnimationFrame(scanLoop);
+          }
+        });
+      return;
+    }
+
+    if (!jsQrLib) return;
+
+    // Decode JS cukup berat; batasi sekitar 6 frame per detik.
+    var now = Date.now();
+    if (now - scannerLastScan < 150) {
+      scannerFrame = window.requestAnimationFrame(scanLoop);
+      return;
+    }
+    scannerLastScan = now;
+
+    var token = decodeQrWithJs();
+    if (token) {
+      stopScanner();
+      verifyToken(token);
+      return;
+    }
+
+    scannerFrame = window.requestAnimationFrame(scanLoop);
+  }
+
+  function decodeQrWithJs() {
+    if (!jsQrLib || !scannerVideo) return "";
+
+    var videoWidth = scannerVideo.videoWidth;
+    var videoHeight = scannerVideo.videoHeight;
+    if (!videoWidth || !videoHeight) return "";
+
+    var scale = Math.min(1, 640 / Math.max(videoWidth, videoHeight));
+    var width = Math.max(1, Math.round(videoWidth * scale));
+    var height = Math.max(1, Math.round(videoHeight * scale));
+
+    if (!scannerCanvas) {
+      scannerCanvas = document.createElement("canvas");
+      scannerContext = scannerCanvas.getContext("2d", {
+        willReadFrequently: true,
       });
+    }
+
+    if (!scannerContext) return "";
+
+    try {
+      scannerCanvas.width = width;
+      scannerCanvas.height = height;
+      scannerContext.drawImage(scannerVideo, 0, 0, width, height);
+
+      var imageData = scannerContext.getImageData(0, 0, width, height);
+      var result = jsQrLib(imageData.data, width, height, {
+        inversionAttempts: "attemptBoth",
+      });
+
+      return result && result.data ? String(result.data) : "";
+    } catch (_) {
+      return "";
+    }
   }
 
   function startScanner() {
     if (!ui || busy) return;
 
+    var hasBarcodeDetector = "BarcodeDetector" in window;
+    var hasJsQr = typeof jsQrLib === "function";
+
     if (
-      !("BarcodeDetector" in window) ||
+      (!hasBarcodeDetector && !hasJsQr) ||
       !navigator.mediaDevices ||
       !navigator.mediaDevices.getUserMedia
     ) {
@@ -776,7 +1183,25 @@
         return scannerVideo.play();
       })
       .then(function () {
-        scannerDetector = new window.BarcodeDetector({ formats: ["qr_code"] });
+        if (hasBarcodeDetector) {
+          try {
+            scannerDetector = new window.BarcodeDetector({
+              formats: ["qr_code"],
+            });
+          } catch (_) {
+            scannerDetector = null;
+          }
+        }
+
+        if (!scannerDetector && !hasJsQr) {
+          stopScanner();
+          setError(
+            "Browser ini tidak mendukung scan QR Code. Gunakan Chrome/Edge terbaru.",
+          );
+          return;
+        }
+
+        scannerLastScan = 0;
         scannerActive = true;
         scanLoop();
       })
@@ -860,12 +1285,29 @@
       headers: { Accept: "application/json" },
     })
       .then(function (response) {
-        if (!response.ok) throw new Error("Public key server tidak tersedia.");
-        return response.json();
+        return response
+          .json()
+          .catch(function () {
+            return null;
+          })
+          .then(function (data) {
+            if (!response.ok) {
+              var detail =
+                data && typeof data.error === "string" && data.error
+                  ? ": " + data.error
+                  : " (HTTP " + response.status + ").";
+              throw new Error("Public key server tidak tersedia" + detail);
+            }
+
+            if (!data || !data.jwk) {
+              throw new Error("Public key server tidak valid.");
+            }
+
+            return data.jwk;
+          });
       })
-      .then(function (data) {
-        if (!data || !data.jwk) throw new Error("Public key server tidak valid.");
-        publicJwkCache = data.jwk;
+      .then(function (jwk) {
+        publicJwkCache = jwk;
         return publicJwkCache;
       });
   }
@@ -922,8 +1364,52 @@
     writeUsedTokens(used);
   }
 
+  function verifyEd25519WithJs(jwk, signature, data) {
+    var publicKey = base64UrlToBytes(jwk.x);
+    return Boolean(ed25519Lib.verify(signature, data, publicKey));
+  }
+
+  function verifyEd25519Signature(jwk, signature, data) {
+    if (
+      window.crypto &&
+      window.crypto.subtle &&
+      typeof window.crypto.subtle.importKey === "function"
+    ) {
+      return window.crypto.subtle
+        .importKey("jwk", jwk, { name: "Ed25519" }, false, ["verify"])
+        .then(function (key) {
+          return window.crypto.subtle.verify(
+            { name: "Ed25519" },
+            key,
+            signature,
+            data,
+          );
+        })
+        .catch(function (error) {
+          if (!ed25519Lib) throw error;
+
+          // Sebagian browser/WebView belum punya Ed25519 di Web Crypto.
+          // Verifikasi ulang dengan implementasi JS murni yang di-bundle.
+          log("Ed25519 WebCrypto gagal, memakai verifier JS", error);
+          return verifyEd25519WithJs(jwk, signature, data);
+        });
+    }
+
+    if (ed25519Lib) {
+      return Promise.resolve().then(function () {
+        return verifyEd25519WithJs(jwk, signature, data);
+      });
+    }
+
+    return Promise.reject(
+      new Error(
+        "Browser ini belum mendukung verifikasi Ed25519. Gunakan browser terbaru.",
+      ),
+    );
+  }
+
   function verifyUnlockToken(token) {
-    if (!window.crypto || !window.crypto.subtle) {
+    if (!ed25519Lib && (!window.crypto || !window.crypto.subtle)) {
       return Promise.reject(
         new Error("Browser tidak mendukung Web Crypto. Gunakan browser terbaru."),
       );
@@ -1002,22 +1488,10 @@
 
     return getPublicJwk()
       .then(function (jwk) {
-        return window.crypto.subtle.importKey(
-          "jwk",
+        return verifyEd25519Signature(
           jwk,
-          { name: "Ed25519" },
-          false,
-          ["verify"],
-        );
-      })
-      .then(function (key) {
-        var signature = base64UrlToBytes(parts[2]);
-        var data = new TextEncoder().encode(parts[0] + "." + parts[1]);
-        return window.crypto.subtle.verify(
-          { name: "Ed25519" },
-          key,
-          signature,
-          data,
+          base64UrlToBytes(parts[2]),
+          new TextEncoder().encode(parts[0] + "." + parts[1]),
         );
       })
       .then(function (valid) {
@@ -1334,12 +1808,22 @@
     return bytes;
   }
 
-  function getTotpKey(secretHex) {
-    if (totpKeyCache && totpKeyCacheSecret === secretHex) {
+  // Seed 64 hex diperlakukan sebagai key biner standar TOTP. Seed teks biasa
+  // dipakai langsung sebagai key HMAC, jadi pengawas bisa memakai frasa acak.
+  function seedToKeyBytes(seed) {
+    var value = String(seed || "").trim();
+    if (/^[0-9a-f]{64}$/i.test(value)) {
+      return hexToBytes(value);
+    }
+    return new TextEncoder().encode(value);
+  }
+
+  function getTotpKey(secret) {
+    if (totpKeyCache && totpKeyCacheSecret === secret) {
       return Promise.resolve(totpKeyCache);
     }
 
-    var keyBytes = hexToBytes(secretHex);
+    var keyBytes = seedToKeyBytes(secret);
 
     return window.crypto.subtle
       .importKey(
@@ -1351,17 +1835,17 @@
       )
       .then(function (key) {
         totpKeyCache = key;
-        totpKeyCacheSecret = secretHex;
+        totpKeyCacheSecret = secret;
         return key;
       });
   }
 
-  function generateTotpCode(secretHex, counter, digits) {
+  function generateTotpCode(secret, counter, digits) {
     var codeDigits = Math.max(4, Math.min(10, Number(digits) || 4));
 
     return Promise.resolve()
       .then(function () {
-        return getTotpKey(secretHex);
+        return getTotpKey(secret);
       })
       .then(function (key) {
         var counterBuffer = new ArrayBuffer(8);
@@ -1390,7 +1874,7 @@
       });
   }
 
-  function verifyTotpClient(code) {
+  function verifyTotpClient(code, nowMs) {
     if (!window.crypto || !window.crypto.subtle) {
       return Promise.reject(
         new Error("Browser tidak mendukung Web Crypto. Gunakan browser terbaru."),
@@ -1398,24 +1882,12 @@
     }
 
     return Promise.resolve().then(function () {
-      var secret = String(config.totpSecret || "").trim();
-      var periodSeconds = Math.max(
-        5,
-        Math.min(
-          300,
-          Math.round(Number(config.totpPeriodSeconds) || 30),
-        ),
-      );
-      var codeDigits = Math.max(
-        4,
-        Math.min(10, Math.round(Number(config.totpDigits) || 4)),
-      );
-      var periodMs = periodSeconds * 1000;
-      var counter = Math.floor(Date.now() / periodMs);
-      var grace = Math.max(
-        0,
-        Math.min(2, Math.round(Number(config.totpGraceWindows) || 0)),
-      );
+      var secret = getUnlockCodeSeed();
+      var periodMs = getUnlockCodePeriodMs();
+      var codeDigits = getUnlockCodeDigits();
+      var now = isFinite(nowMs) ? Number(nowMs) : Date.now();
+      var counter = Math.floor(now / periodMs);
+      var grace = getUnlockCodeGraceWindows();
       var counters = [counter];
 
       for (var i = 1; i <= grace; i += 1) {
@@ -1437,6 +1909,100 @@
         );
       });
     });
+  }
+
+  function submitCode(rawCode) {
+    if (!locked || busy) return Promise.resolve(false);
+
+    if (!isUnlockCodeEnabled()) {
+      setError("Kode 4 digit tidak diaktifkan.");
+      return Promise.resolve(false);
+    }
+
+    var code = String(rawCode || "").trim();
+    var digits = getUnlockCodeDigits();
+
+    if (!new RegExp("^\\d{" + digits + "}$").test(code)) {
+      setError("Kode harus " + digits + " digit angka.");
+      if (ui && ui.codeInput) {
+        ui.codeInput.setAttribute("aria-invalid", "true");
+        ui.codeInput.focus();
+      }
+      return Promise.resolve(false);
+    }
+
+    var now = Date.now();
+    var periodMs = getUnlockCodePeriodMs();
+    var windowId = Math.floor(now / periodMs);
+    var maxAttempts = getUnlockCodeMaxAttempts();
+    var attemptState = readCodeAttemptState(windowId);
+
+    if (attemptState.count >= maxAttempts) {
+      var waitSeconds = Math.max(
+        1,
+        Math.ceil((periodMs - (now % periodMs)) / 1000),
+      );
+      setError(
+        "Terlalu banyak percobaan. Tunggu " +
+          waitSeconds +
+          " detik untuk kode berikutnya.",
+      );
+      if (ui && ui.codeInput) {
+        ui.codeInput.setAttribute("aria-invalid", "true");
+      }
+      return Promise.resolve(false);
+    }
+
+    setError("");
+    setBusy(true);
+
+    return verifyTotpClient(code, now)
+      .then(function () {
+        clearCodeAttempts();
+        if (ui && ui.codeInput) ui.codeInput.value = "";
+        unlock();
+        return true;
+      })
+      .catch(function (error) {
+        if (
+          error &&
+          typeof error.message === "string" &&
+          error.message.indexOf("Browser tidak mendukung") === 0
+        ) {
+          setError(error.message);
+          return false;
+        }
+
+        var updated = recordCodeAttemptFailure(windowId);
+        var remaining = Math.max(0, maxAttempts - updated.count);
+
+        if (remaining > 0) {
+          setError(
+            "Kode salah atau sudah berubah. Sisa " +
+              remaining +
+              " percobaan.",
+          );
+        } else {
+          setError("Terlalu banyak percobaan. Tunggu kode berikutnya.");
+        }
+
+        if (ui && ui.codeInput) {
+          ui.codeInput.value = "";
+          ui.codeInput.setAttribute("aria-invalid", "true");
+        }
+
+        log("kode 4 digit ditolak", error);
+        return false;
+      })
+      .then(function (result) {
+        setBusy(false);
+
+        if (locked && !result && ui && ui.codeInput) {
+          ui.codeInput.focus();
+        }
+
+        return result;
+      });
   }
 
   function verifyServerCode(code) {
@@ -1487,6 +2053,50 @@
       });
   }
 
+  function getLockDescriptionHtml() {
+    var seconds = Math.round(config.lockAfterMs / 1000);
+    var instruction = isUnlockCodeEnabled()
+      ? "Masukkan kode " +
+        getUnlockCodeDigits() +
+        " digit dari pengawas, atau scan QR Code."
+      : "Scan QR Code dari pengawas untuk membuka kunci.";
+
+    return (
+      "Kamu meninggalkan aplikasi lebih dari " +
+      seconds +
+      " detik.<br>" +
+      instruction
+    );
+  }
+
+  function updateUnlockCodeUi() {
+    if (!ui) return;
+
+    var enabled = isUnlockCodeEnabled();
+    var digits = getUnlockCodeDigits();
+    var periodSeconds = getUnlockCodePeriodSeconds();
+
+    if (ui.codeForm) ui.codeForm.hidden = !enabled;
+    if (ui.codeDivider) ui.codeDivider.hidden = !enabled;
+
+    if (ui.codeLabel) {
+      ui.codeLabel.textContent = "Kode " + digits + " digit";
+    }
+
+    if (ui.codeInput) {
+      ui.codeInput.maxLength = digits;
+      ui.codeInput.placeholder = Array(digits + 1).join("0");
+      if (!enabled) ui.codeInput.value = "";
+    }
+
+    if (ui.codeHint) {
+      ui.codeHint.textContent =
+        "Kode berganti setiap " + periodSeconds + " detik.";
+    }
+
+    if (ui.desc) ui.desc.innerHTML = getLockDescriptionHtml();
+  }
+
   function buildUi() {
     if (host) return;
 
@@ -1494,7 +2104,9 @@
     host.id = "elearning-kiosk-lock-root";
     host.setAttribute("data-kiosk-lock", "true");
     host.style.cssText =
-      "position:fixed;inset:0;z-index:" + config.zIndex + ";display:none;";
+      "position:fixed;inset:0;z-index:" +
+      config.zIndex +
+      ";display:block;pointer-events:none;";
     document.documentElement.appendChild(host);
 
     shadow = host.attachShadow({ mode: "open" });
@@ -1507,22 +2119,31 @@
       '<path d="M7 11V7a5 5 0 0 1 10 0v4"></path>' +
       "</svg>" +
       '<h1 id="kiosk-title" class="kiosk__title">Aplikasi terkunci</h1>' +
-      '<p class="kiosk__desc">Kamu meninggalkan aplikasi lebih dari ' +
-      Math.round(config.lockAfterMs / 1000) +
-      " detik.<br>Scan QR Code dari pengawas untuk membuka kunci.</p>" +
+      '<p class="kiosk__desc">' +
+      getLockDescriptionHtml() +
+      "</p>" +
       "</div>" +
       '<div class="kiosk__form">' +
       '<div class="kiosk__error" role="alert" aria-live="assertive"></div>' +
       '<button class="kiosk__scan" type="button">Scan QR Code</button>' +
       '<div class="kiosk__scanner" aria-live="polite"></div>' +
+      '<div class="kiosk__divider" hidden><span>atau</span></div>' +
+      '<form class="kiosk__code-form" hidden novalidate>' +
+      '<label class="kiosk__label kiosk__code-label" for="kiosk-code">Kode 4 digit</label>' +
+      '<div class="kiosk__code-row">' +
+      '<input class="kiosk__input kiosk__code-input" id="kiosk-code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="0000" autocomplete="one-time-code" spellcheck="false" aria-describedby="kiosk-code-hint" />' +
+      '<button class="kiosk__button kiosk__code-submit" type="submit">Buka</button>' +
+      "</div>" +
+      '<p class="kiosk__hint" id="kiosk-code-hint">Kode berganti setiap 30 detik.</p>' +
+      "</form>" +
+      "</div>" +
       "</div>" +
       "</div>" +
       '<button class="kiosk__fullscreen" type="button" aria-label="Layar penuh" title="Layar penuh">' +
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
       '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>' +
       "</svg>" +
-      "</button>" +
-      "</div>";
+      "</button>";
 
     var cssText = typeof CSS === "string" ? CSS : "";
 
@@ -1545,18 +2166,65 @@
     }
 
     ui = {
+      overlay: shadow.querySelector(".kiosk"),
       panel: shadow.querySelector(".kiosk__panel"),
+      desc: shadow.querySelector(".kiosk__desc"),
       error: shadow.querySelector(".kiosk__error"),
       scanButton: shadow.querySelector(".kiosk__scan"),
       scanner: shadow.querySelector(".kiosk__scanner"),
+      divider: shadow.querySelector(".kiosk__divider"),
+      codeForm: shadow.querySelector(".kiosk__code-form"),
+      codeLabel: shadow.querySelector(".kiosk__code-label"),
+      codeInput: shadow.querySelector(".kiosk__code-input"),
+      codeSubmit: shadow.querySelector(".kiosk__code-submit"),
+      codeHint: shadow.querySelector(".kiosk__hint"),
       fullscreenButton: shadow.querySelector(".kiosk__fullscreen"),
     };
 
     ui.scanButton.addEventListener("click", startScanner);
-    if (ui.fullscreenButton) {
-      ui.fullscreenButton.addEventListener("click", handleFullscreenToggle);
+
+    if (ui.codeForm) {
+      ui.codeForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        submitCode(ui.codeInput ? ui.codeInput.value : "");
+      });
     }
 
+    if (ui.codeInput) {
+      ui.codeInput.addEventListener("input", function () {
+        var cleaned = String(ui.codeInput.value || "")
+          .replace(/\D/g, "")
+          .slice(0, getUnlockCodeDigits());
+
+        if (cleaned !== ui.codeInput.value) {
+          ui.codeInput.value = cleaned;
+        }
+
+        if (ui.error && ui.error.classList.contains("is-visible")) {
+          setError("");
+        }
+      });
+    }
+
+    if (ui.fullscreenButton) {
+      ui.fullscreenButton.addEventListener("click", onFullscreenClick);
+      ui.fullscreenButton.addEventListener("pointerdown", onFullscreenDragStart);
+      ui.fullscreenButton.addEventListener("pointermove", onFullscreenDragMove);
+      ui.fullscreenButton.addEventListener("pointerup", onFullscreenDragEnd);
+      ui.fullscreenButton.addEventListener(
+        "pointercancel",
+        onFullscreenDragEnd,
+      );
+      ui.fullscreenButton.addEventListener(
+        "lostpointercapture",
+        onFullscreenDragEnd,
+      );
+    }
+
+    // Overlay kunci tersembunyi; tombol fullscreen tetap terlihat.
+    if (ui.overlay) ui.overlay.style.display = "none";
+    updateUnlockCodeUi();
+    restoreFullscreenPosition();
     updateFullscreenButton();
   }
 
@@ -1565,6 +2233,9 @@
     stopScanner();
     setError("");
     setBusy(false);
+    updateUnlockCodeUi();
+
+    if (ui && ui.codeInput) ui.codeInput.value = "";
 
     previousHtmlOverflow = document.documentElement.style.overflow;
     previousBodyOverflow = document.body ? document.body.style.overflow : "";
@@ -1576,6 +2247,7 @@
     }
 
     host.style.display = "block";
+    if (ui && ui.overlay) ui.overlay.style.display = "";
     document.addEventListener("keydown", handleKeydown, true);
 
     window.setTimeout(function () {
@@ -1586,7 +2258,7 @@
   function hideOverlay() {
     if (!host) return;
 
-    host.style.display = "none";
+    if (ui && ui.overlay) ui.overlay.style.display = "none";
     document.removeEventListener("keydown", handleKeydown, true);
     document.documentElement.style.overflow = previousHtmlOverflow;
     if (document.body) {
@@ -1603,6 +2275,8 @@
     window.addEventListener("pagehide", onPageHide);
     window.addEventListener("pageshow", onPageShow);
     window.addEventListener("storage", onStorage);
+    window.addEventListener("resize", clampFullscreenPositionInView);
+    window.addEventListener("orientationchange", clampFullscreenPositionInView);
     window.addEventListener("pointerdown", onUserActivity, true);
     window.addEventListener("keydown", onUserActivity, true);
     window.addEventListener("touchstart", onUserActivity, true);
@@ -1616,6 +2290,11 @@
     window.removeEventListener("pagehide", onPageHide);
     window.removeEventListener("pageshow", onPageShow);
     window.removeEventListener("storage", onStorage);
+    window.removeEventListener("resize", clampFullscreenPositionInView);
+    window.removeEventListener(
+      "orientationchange",
+      clampFullscreenPositionInView,
+    );
     window.removeEventListener("pointerdown", onUserActivity, true);
     window.removeEventListener("keydown", onUserActivity, true);
     window.removeEventListener("touchstart", onUserActivity, true);
@@ -1629,6 +2308,15 @@
     if (initialized) return;
     if (!document.documentElement || !document.body) {
       window.addEventListener("DOMContentLoaded", init, { once: true });
+      return;
+    }
+
+    if (!isQuizPage()) {
+      initialized = true;
+      roleResolved = true;
+      isStudent = false;
+      roleStatus = { isStudent: false, source: "out-of-scope" };
+      log("lock disabled: bukan halaman quiz");
       return;
     }
 
@@ -1650,13 +2338,17 @@
           detachListeners();
           clearAwayTimer();
           clearBlurTimer();
+          stopScreenWakeLock();
           safeRemove(storage.locked);
+          safeRemove(storage.lockedScope);
           safeRemove(storage.away);
           log("role: bukan siswa, lock dinonaktifkan", result);
           return false;
         }
 
         checkBootState();
+        if (document.visibilityState === "hidden") markAway();
+        requestScreenWakeLock();
         log("initialized", { role: result });
         return true;
       })
@@ -1669,11 +2361,15 @@
 
         if (isStudent) {
           checkBootState();
+          if (document.visibilityState === "hidden") markAway();
+          requestScreenWakeLock();
         } else {
           detachListeners();
           clearAwayTimer();
           clearBlurTimer();
+          stopScreenWakeLock();
           safeRemove(storage.locked);
+          safeRemove(storage.lockedScope);
           safeRemove(storage.away);
         }
 
@@ -1686,7 +2382,14 @@
     if (!next || typeof next !== "object") return;
 
     var previousStorageKey = config.storageKey;
+    var previousSecret = String(config.totpSecret || "");
     config = Object.assign({}, config, next);
+
+    if (next.unlockCodeSeed !== undefined && next.totpSecret === undefined) {
+      config.totpSecret = next.unlockCodeSeed
+        ? String(next.unlockCodeSeed)
+        : null;
+    }
 
     if (typeof config.lockAfterMs !== "number" || config.lockAfterMs < 500) {
       config.lockAfterMs = DEFAULTS.lockAfterMs;
@@ -1695,6 +2398,18 @@
     if (config.storageKey !== previousStorageKey) {
       storage = makeStorageKeys(config.storageKey);
     }
+
+    if (String(config.totpSecret || "") !== previousSecret) {
+      clearCodeAttempts();
+    }
+
+    if (config.keepScreenAwake) {
+      requestScreenWakeLock();
+    } else {
+      stopScreenWakeLock();
+    }
+
+    updateUnlockCodeUi();
   }
 
   function handleFullscreenToggle() {
@@ -1723,6 +2438,154 @@
     ui.fullscreenButton.innerHTML = isFullscreen
       ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path></svg>'
       : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path></svg>';
+
+    clampFullscreenPositionInView();
+  }
+
+  function getFullscreenButtonSize() {
+    var button = ui && ui.fullscreenButton;
+    return {
+      width: button ? button.offsetWidth || 44 : 44,
+      height: button ? button.offsetHeight || 44 : 44,
+    };
+  }
+
+  function clampFullscreenPosition(x, y) {
+    var size = getFullscreenButtonSize();
+    var margin = 8;
+    var maxX = Math.max(margin, window.innerWidth - size.width - margin);
+    var maxY = Math.max(margin, window.innerHeight - size.height - margin);
+
+    return {
+      x: Math.min(Math.max(x, margin), maxX),
+      y: Math.min(Math.max(y, margin), maxY),
+    };
+  }
+
+  function applyFullscreenPosition(x, y, save) {
+    if (!ui || !ui.fullscreenButton) return;
+
+    var pos = clampFullscreenPosition(x, y);
+    var button = ui.fullscreenButton;
+
+    button.style.left = pos.x + "px";
+    button.style.top = pos.y + "px";
+    button.style.right = "auto";
+    button.style.bottom = "auto";
+
+    if (save) {
+      safeSet(storage.fullscreenPos, JSON.stringify(pos));
+    }
+  }
+
+  function restoreFullscreenPosition() {
+    var raw = safeGet(storage.fullscreenPos);
+    if (!raw) return;
+
+    try {
+      var pos = JSON.parse(raw);
+      if (pos && isFinite(pos.x) && isFinite(pos.y)) {
+        applyFullscreenPosition(Number(pos.x), Number(pos.y), false);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function clampFullscreenPositionInView() {
+    if (!ui || !ui.fullscreenButton) return;
+
+    var button = ui.fullscreenButton;
+    if (!button.style.left && !button.style.top) return;
+
+    var rect = button.getBoundingClientRect();
+    applyFullscreenPosition(rect.left, rect.top, true);
+  }
+
+  function onFullscreenClick(event) {
+    if (suppressFullscreenClick) {
+      suppressFullscreenClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    handleFullscreenToggle();
+  }
+
+  function onFullscreenDragStart(event) {
+    if (!ui || !ui.fullscreenButton) return;
+    if (event.button !== 0 || event.isPrimary === false) return;
+
+    suppressFullscreenClick = false;
+
+    var button = ui.fullscreenButton;
+    var rect = button.getBoundingClientRect();
+
+    fullscreenDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      moved: false,
+    };
+
+    try {
+      button.setPointerCapture(event.pointerId);
+    } catch (_) {
+      /* ignore */
+    }
+    button.classList.add("is-dragging");
+  }
+
+  function onFullscreenDragMove(event) {
+    if (!fullscreenDrag || event.pointerId !== fullscreenDrag.pointerId) return;
+    if (!ui || !ui.fullscreenButton) return;
+
+    var dx = event.clientX - fullscreenDrag.startX;
+    var dy = event.clientY - fullscreenDrag.startY;
+
+    if (!fullscreenDrag.moved) {
+      if (dx * dx + dy * dy < 36) return;
+      fullscreenDrag.moved = true;
+    }
+
+    event.preventDefault();
+    applyFullscreenPosition(
+      event.clientX - fullscreenDrag.offsetX,
+      event.clientY - fullscreenDrag.offsetY,
+      false,
+    );
+  }
+
+  function onFullscreenDragEnd(event) {
+    if (!fullscreenDrag || event.pointerId !== fullscreenDrag.pointerId) return;
+    if (!ui || !ui.fullscreenButton) {
+      fullscreenDrag = null;
+      return;
+    }
+
+    var button = ui.fullscreenButton;
+    var moved = fullscreenDrag.moved;
+    fullscreenDrag = null;
+    button.classList.remove("is-dragging");
+
+    try {
+      button.releasePointerCapture(event.pointerId);
+    } catch (_) {
+      /* ignore */
+    }
+
+    if (moved) {
+      suppressFullscreenClick = true;
+      window.setTimeout(function () {
+        suppressFullscreenClick = false;
+      }, 350);
+
+      var rect = button.getBoundingClientRect();
+      applyFullscreenPosition(rect.left, rect.top, true);
+    }
   }
 
   function requestFullscreen() {
@@ -1742,6 +2605,7 @@
     clearBlurTimer();
     stopScanner();
     stopDemoKeyRefresh();
+    stopScreenWakeLock();
     roleRequestId += 1;
     rolePromise = null;
     detachListeners();
@@ -1753,6 +2617,9 @@
     ui = null;
     initialized = false;
     locked = false;
+    pageUnloading = false;
+    fullscreenDrag = null;
+    suppressFullscreenClick = false;
     roleResolved = !config.studentOnly;
     isStudent = !config.studentOnly;
     roleStatus = {
@@ -1802,11 +2669,12 @@
       overflow-y: auto;
       background: var(--background);
       color: var(--foreground);
+      pointer-events: auto;
     }
     .kiosk__fullscreen {
       position: fixed;
-      top: 16px;
-      right: 16px;
+      right: calc(16px + env(safe-area-inset-right));
+      bottom: calc(16px + env(safe-area-inset-bottom));
       z-index: 20;
       display: inline-flex;
       align-items: center;
@@ -1819,7 +2687,15 @@
       background: var(--background);
       color: var(--foreground);
       box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.35);
-      cursor: pointer;
+      cursor: grab;
+      pointer-events: auto;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .kiosk__fullscreen.is-dragging {
+      cursor: grabbing;
     }
     .kiosk__fullscreen:hover {
       background: var(--accent);
@@ -1888,6 +2764,45 @@
       border: 0;
       background: transparent;
     }
+    .kiosk__divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted-foreground);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .kiosk__divider::before,
+    .kiosk__divider::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .kiosk__divider[hidden],
+    .kiosk__code-form[hidden] {
+      display: none;
+    }
+    .kiosk__code-form {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    .kiosk__code-row {
+      display: flex;
+      gap: 8px;
+    }
+    .kiosk__hint {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--muted-foreground);
+    }
     .kiosk__field {
       display: grid;
       gap: 8px;
@@ -1929,6 +2844,24 @@
     .kiosk__input[aria-invalid="true"] {
       border-color: var(--destructive);
       box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.2);
+    }
+    .kiosk__code-input {
+      flex: 1;
+      height: 48px;
+      padding-left: 12px;
+      padding-right: 12px;
+      text-align: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 22px;
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: 0.32em;
+    }
+    .kiosk__button.kiosk__code-submit {
+      flex: 0 0 auto;
+      width: auto;
+      height: 48px;
+      padding: 0 18px;
     }
     .kiosk__demo {
       display: flex;
@@ -2114,6 +3047,7 @@
     }
     @media (min-width: 768px) {
       .kiosk__input { font-size: 14px; }
+      .kiosk__code-input { font-size: 22px; }
     }
     @media (prefers-reduced-motion: reduce) {
       .kiosk__button, .kiosk__input, .kiosk__scan, .kiosk__demo-button { transition: none; }
@@ -2131,8 +3065,17 @@
     submitToken: function (token) {
       return verifyToken(token);
     },
+    submitCode: function (code) {
+      return submitCode(code);
+    },
+    isCodeEnabled: function () {
+      return isUnlockCodeEnabled();
+    },
     isLocked: function () {
       return locked;
+    },
+    isScreenAwake: function () {
+      return Boolean(wakeLockSentinel && !wakeLockSentinel.released);
     },
     isStudent: function () {
       return roleResolved ? isStudent : null;
